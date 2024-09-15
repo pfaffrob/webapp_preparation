@@ -1,0 +1,345 @@
+```{python}
+import rasterio
+from rasterio.mask import geometry_mask
+import numpy as np
+from shapely.geometry import shape, mapping
+
+```
+
+
+```{python}
+import rasterio
+from rasterio.features import geometry_mask
+from shapely.geometry import shape, mapping
+import numpy as np
+from tqdm import tqdm
+
+def change_values_outside_mask(input_file, output_file, mask, new_value=None):
+    # Load the input TIF file
+    with rasterio.open(input_file) as src:
+        # Combine all geometries in the GeoDataFrame into a single geometry
+        combined_geometry = mask.unary_union
+
+        # Create a mask using the input TIF file's georeferencing and the combined geometry
+        mask_array = geometry_mask([mapping(combined_geometry)], src.shape, transform=src.transform, invert=True)
+
+        # Determine the value to use for replacement
+        if new_value is None:
+            new_value = src.nodata if src.nodata is not None else 0
+
+        # Update the metadata
+        meta = src.meta
+        meta.update(compress='lzw')
+
+        # Check the dimensions of the input file
+        if src.width > 5000 or src.height > 5000:
+            # Process the file in windows of size 5000x5000
+            window_size = 5000
+            with rasterio.open(output_file, 'w', **meta) as dst:
+                total_windows = (src.height // window_size + 1) * (src.width // window_size + 1)
+                with tqdm(total=total_windows, desc="Processing windows") as pbar:
+                    for i in range(0, src.height, window_size):
+                        for j in range(0, src.width, window_size):
+                            try:
+                                # Adjust window size for edge cases
+                                win_height = min(window_size, src.height - i)
+                                win_width = min(window_size, src.width - j)
+                                window = rasterio.windows.Window(j, i, win_width, win_height)
+                                data_window = src.read(1, window=window)
+                                mask_window = mask_array[i:i+win_height, j:j+win_width]
+                                data_window = np.where(mask_window, data_window, new_value)
+                                if np.any(data_window != new_value):
+                                    dst.write(data_window, 1, window=window)
+                            except Exception as e:
+                                print(f"Error processing window ({i}, {j}): {e}")
+                            pbar.update(1)
+        else:
+            # Process the entire file at once
+            try:
+                data = src.read(1)
+                data = np.where(mask_array, data, new_value)
+                if np.any(data != new_value):
+                    with rasterio.open(output_file, 'w', **meta) as dst:
+                        dst.write(data, 1)
+            except Exception as e:
+                print(f"Error processing entire file: {e}")
+
+
+```
+
+
+
+```{python}
+import os
+
+def list_files(directory, ends_with = '.tif'):
+    # List to store the paths of .tif files
+    tif_files = []
+
+    # Walk through the directory
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith(ends_with):
+                # Add the full path of the .tif file to the list
+                tif_files.append(os.path.join(root, file))
+
+    return tif_files
+```
+
+```{python}
+import geopandas as gpd
+import fiona
+# Path to your geodatabase and the specific layer within the feature dataset
+
+# Read the specific layer into a GeoDataFrame
+ZH_SG_TG = gpd.read_file('Bevoelkerung_Boundaries/ZH_SG_TG.json')
+
+
+ZH_SG_TG
+
+
+```
+
+```{python}
+# Example usage
+import os
+
+directory = '.'
+tif_files = list_files(directory)
+for tif_file in tif_files:
+    if tif_file.endswith('_ZH_SG_TG.tif'):
+        print(f'{tif_file} already processed, skipping...')
+        continue
+    output = tif_file.replace('.tif', '_ZH_SG_TG.tif')
+    change_values_outside_mask(input_file=tif_file, output_file=output, mask=ZH_SG_TG, new_value=None)
+    print(f'{tif_file} clipped')
+```
+
+```{python}
+import os
+import rasterio
+from rasterio.enums import Resampling
+
+def list_files(directory):
+    tif_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith('.tif'):
+                tif_files.append(os.path.join(root, file))
+    return tif_files
+
+def resample_raster(input_file, output_file, reference_file, resampling_method=Resampling.bilinear):
+    with rasterio.open(reference_file) as ref:
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+        ref_shape = ref.shape
+
+    with rasterio.open(input_file) as src:
+        data = src.read(
+            out_shape=(
+                src.count,
+                ref_shape[0],
+                ref_shape[1]
+            ),
+            resampling=resampling_method
+        )
+        transform = src.transform * src.transform.scale(
+            (src.width / data.shape[-1]),
+            (src.height / data.shape[-2])
+        )
+
+        profile = src.profile
+        profile.update({
+            'crs': ref_crs,
+            'transform': ref_transform,
+            'width': ref_shape[1],
+            'height': ref_shape[0],
+            'compress': 'lzw'
+        })
+
+        with rasterio.open(output_file, 'w', **profile) as dst:
+            dst.write(data)
+
+def process_directory(directory, reference_file):
+    tif_files = list_files(directory)
+    for tif_file in tif_files:
+        input_path = tif_file
+        output_path = input_path.replace('.tif', '_resampled.tif')
+        resample_raster(input_file=input_path, output_file=output_path, reference_file=reference_file)
+        print(f'{tif_file} resampled to {output_path}')
+
+
+
+
+
+# Example usage
+directory = './Boden/potentialkarten_invasivergebietsfremderarten'
+reference_raster = 'Bevoelkerung_Boundaries/ag-b-00.03-vz2023statpop/Bevoelkerung_ZH_SG_TG.tif'  # Path to your reference raster
+process_directory(directory, reference_raster)
+
+```
+
+
+```{python}
+import os
+import rasterio
+import geopandas as gpd
+from rasterio.features import shapes
+from shapely.geometry import shape
+from tqdm import tqdm
+
+def list_tif_files(directory):
+    tif_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith('resampled.tif'):
+                tif_files.append(os.path.join(root, file))
+    return tif_files
+
+def tif_to_shapefile(input_file, output_file):
+    with rasterio.open(input_file) as src:
+        image = src.read(1)  # Read the first band
+        mask = image != src.nodata  # Create a mask for valid data
+
+        # Check if the image contains valid data
+        if not mask.any():
+            print(f'{input_file} contains no valid data, skipping...')
+            return
+
+        # Ensure the image dtype is one of the allowed types, convert int8 to float32
+        if image.dtype == 'int8':
+            image = image.astype('float32')
+        if image.dtype == 'float64':
+            image = image.astype('float32')
+        elif image.dtype not in ['int16', 'int32', 'uint8', 'uint16', 'float32']:
+            print(f'{input_file} has unsupported dtype {image.dtype}, skipping...')
+            return
+
+        results = (
+            {'properties': {'raster_val': v}, 'geometry': shape(s)}
+            for i, (s, v) in enumerate(
+                shapes(image, mask=mask, transform=src.transform)
+            )
+        )
+
+        geoms = list(results)
+        if not geoms:
+            print(f'{input_file} contains no geometries, skipping...')
+            return
+
+        gdf = gpd.GeoDataFrame.from_features(geoms)
+        gdf.crs = src.crs
+        gdf.to_file(output_file, driver='ESRI Shapefile')
+
+def process_directory_to_shapefiles(directory):
+    tif_files = list_tif_files(directory)
+    for tif_file in tqdm(tif_files, desc='File'):
+        output_file = tif_file.replace('.tif', '.shp')
+        tif_to_shapefile(tif_file, output_file)
+        print(f'{tif_file} converted to {output_file}')
+
+# Example usage
+directory = '.'
+process_directory_to_shapefiles(directory)
+
+
+
+```
+
+
+```{python}
+import os
+import rasterio
+import geopandas as gpd
+from rasterio.features import shapes
+from shapely.geometry import shape
+
+def list_tif_files(directory):
+    tif_files = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith('resampled.tif'):
+                tif_files.append(os.path.join(root, file))
+    return tif_files
+
+def tif_to_shapefile(input_file, output_file):
+    with rasterio.open(input_file) as src:
+        image = src.read(1)  # Read the first band
+        mask = image != src.nodata  # Create a mask for valid data
+
+        # Check if the image contains valid data
+        if not mask.any():
+            print(f'{input_file} contains no valid data, skipping...')
+            return
+
+        # Ensure the image dtype is one of the allowed types, convert int8 to float32
+        if image.dtype == 'int8':
+            image = image.astype('float32')
+
+
+            results = (
+                {'properties': {'raster_val': v}, 'geometry': s}
+                for i, (s, v) in enumerate(
+                    shapes(image, mask=mask, transform=src.transform)
+                )
+            )
+
+            geoms = list(results)
+            if not geoms:
+                print(f'{input_file} contains no geometries, skipping...')
+                return
+
+            gdf = gpd.GeoDataFrame.from_features(geoms)
+            gdf.crs = src.crs
+            gdf.to_file(output_file, driver='ESRI Shapefile')
+
+def process_directory_to_shapefiles(directory):
+    tif_files = list_tif_files(directory)
+    for tif_file in tif_files:
+        output_file = tif_file.replace('.tif', '.shp')
+        tif_to_shapefile(tif_file, output_file)
+        print(f'{tif_file} converted to {output_file}')
+
+# Example usage
+directory = '.'
+process_directory_to_shapefiles(directory)
+
+```
+
+```{python}
+def delete_files(file_list):
+    for file in file_list:
+        try:
+            os.remove(file)
+            print(f"Deleted {file}")
+        except FileNotFoundError:
+            print(f"{file} not found")
+        except Exception as e:
+            print(f"Error deleting {file}: {e}")
+```
+
+
+```{python}
+delete = list_files(directory, ends_with='ZH_SG_TG.tif')
+delete_files(delete)
+```
+
+
+
+```{python}
+import fiona 
+import geopandas as gpd
+
+gdb_file = 'Bevoelkerung_Boundaries/swissboundaries3d_2024-01_2056_5728.gdb'
+
+# Get all the layers from the .gdb file 
+layers = fiona.listlayers(gdb_file)
+```
+
+
+
+```{python}
+ZH_SG_TG = gpd.read_file('Bevoelkerung_Boundaries/ZH_SG_TG.json')
+
+ZH_SG_TG.to_file('ZH_SG_TG.shp')
+```
